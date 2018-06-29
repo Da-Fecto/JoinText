@@ -1,0 +1,297 @@
+<?php namespace ProcessWire;
+
+/**
+ * Joins text from selected fields and saves it to destination field.
+ *
+ * @author Martijn Geerts (Agrio)
+ *
+ * ProcessWire 2.x
+ * Copyright (C) 2011 by Ryan Cramer
+ * Licensed under GNU/GPL v2, see LICENSE.TXT
+ *
+ * http://www.processwire.com
+ * http://www.ryancramer.com
+ *
+ */
+class JoinText extends WireData implements Module, ConfigurableModule {
+
+	/**
+	 * Public static Module info
+	 *
+	 * @return array Associative array module info
+	 *
+	 */
+	public static function getModuleInfo() {
+		return array(
+			'title' => 'Join Text',
+			'version' => '0.0.2',
+			'summary' => __("Joins text from selected fields and saves it to assigned field. "),
+			'author' => 'Martijn Geerts',
+			'autoload' => true,
+			'singular' => true,
+			'icon' => "link",
+			'permission' => 'page-edit',
+			);
+	}
+
+	/**
+	 * After saved field
+	 *
+	 * @param HookEvent $event
+	 * @return void
+	 */
+	public function afterPagesSavedField(HookEvent $event) {
+		$page = $event->argumentsbyName('page');
+		$field = $event->argumentsbyName('field');
+
+		if ($field->name === $this->destination) return;
+
+		$isSource = in_array($field->name, $this->source);
+		$isChanged = $page->isChanged($field->name);
+
+		if ($isSource && $isChanged) {
+			$this->set('saveDestination', true);
+		}
+	}
+
+	/**
+	 * Get value from Page
+	 *
+	 * @param Page $page
+	 * @param string $name Fieldname
+	 * @return string
+	 */
+	private function getValue(Page $page, $fieldname) {
+		if ($fieldname === $this->destination) return;
+		$value = $page->get($fieldname);
+		return is_string($value) ? $value . " " : '';
+	}
+
+	/**
+	 * Save destination field
+	 *
+	 * @note The page from PageEdit::getPage will alway be the last page saved.
+	 *
+	 * @param HookEvent $event
+	 * @return void
+	 */
+	public function afterPagesSaved(HookEvent $event) {
+		if (!$this->saveDestination) return;
+
+		/** @var Page $targetPage PageEditExecute edit page */
+		$targetPage = $this->get('targetPage');
+		/** @var Page $page Can be repeater like page */
+		$pageFromField = $event->arguments(0);
+
+		// Only continue when ProcessPageEdit page is saved.
+		if ($targetPage !== $pageFromField) return;
+
+		$text = "";
+		foreach ($this->fieldsFromTemplate as $field) {
+			$inSource = in_array($field->name, $this->source);
+			$isPageField = $inSource && wireInstanceOf($field->type, 'FieldtypePage');
+
+			if ($isPageField) {
+				$value = $targetPage->get($field->name);
+				if (wireInstanceOf($value, 'Page')) {
+					if ($value->title) $text .= $value->get("title|name") . " ";
+				} else {
+					foreach ($value as $item) {
+						if ($item->title) $text .= $item->get("title|name") . " ";
+					}
+				}
+
+			} else if ($inSource) {
+				$text .= $this->getValue($targetPage, $field->name);
+
+			} else if (wireInstanceOf($field->type, 'FieldtypeRepeater')) {
+				$repeaterArray = $targetPage->get($field->name);
+				foreach ($repeaterArray as $item) {
+					// only text...
+					foreach($this->source as $name) {
+						if (!$item->template->fields->has($name)) continue;
+						$text .= $this->getValue($item, $name);
+					}
+				}
+			}
+		}
+
+		$targetPage->setAndSave($this->destination, self::sanitizeText($text), array(
+			"quiet" => $this->quiet,
+			"noHooks" => $this->noHooks)
+		);
+	}
+
+	/**
+	 * Hide destination inputfield (for non-superusers)
+	 *
+	 * @param ProcessPageEdit $pageEdit
+	 * @return void
+	 */
+	private function hideDestination(ProcessPageEdit $pageEdit) {
+		$field = $pageEdit->fields->get($this->destination);
+
+		if ($this->wire('user')->isSuperuser()) {
+			$field->set('notes', 'Shown to superuser only! @see: ' . $this->className() . '.module');
+			return;
+		}
+
+		$field->set('collapsed', Inputfield::collapsedHidden);
+	}
+
+	/**
+	 * Conditional Hooks
+	 *
+	 * @param HookEvent $event
+	 * @return void
+	 */
+	public function beforeProcessPageEditExecute(HookEvent $event) {
+		/** @var ProcessPageEdit */
+		$pageEdit = $event->object;
+		/** @var Page ProcessPageEdit page */
+		$page = $pageEdit->getPage();
+		/** @var FieldGroup */
+		$fieldsFromTemplate = $page->template->fields;
+
+		if (!$this->destination) return;
+		if (!$fieldsFromTemplate->has($this->destination)) return;
+		if ($this->hide) $this->hideDestination($pageEdit);
+
+		$this->set('fieldsFromTemplate', $fieldsFromTemplate);
+		$this->set('targetPage', $page);
+		$this->addHookAfter("Fieldtype::savePageField", $this, "afterPagesSavedField");
+		$this->addHookAfter("pages::saved", $this, "afterPagesSaved");
+	}
+
+	public function init() {
+		$this->addHookBefore("ProcessPageEdit::execute", $this, "beforeProcessPageEditExecute");
+	}
+
+	/**
+	 * Defaults
+	 *
+	 * @var array
+	 */
+	private $defaults = array(
+		"quiet" => true,
+		"noHooks" => true,
+		"hide" => true,
+	);
+
+	/**
+	 * Set defaults
+	 *
+	 */
+	public function __construct() {
+		foreach ($defaults as $key => $value) $this->set($key, $value);
+	}
+
+	public function set($key, $value) {
+		if (isset($this->defaults[$key])) $value = boolval($value);
+		parent::set($key, $value);
+	}
+
+	/**
+	 * Text sanitizer
+	 *
+	 * Text sanitizer for storing.
+	 *
+	 * @param string $text
+	 * @return void
+	 */
+	public static function sanitizeText($text) {
+		$text = ' ' . strip_tags($text);
+		// Drop non word chars
+		$text = preg_replace('/[^a-z\d]+/i', ' ', $text);
+		// Drop small words
+		$text = preg_replace("/\b\w{1,3}\b/", ' ', $text);
+		// Replace double+ whitespaces
+		$text = preg_replace('!\s+!', ' ', $text);
+		// Trim it
+		$text = trim($text);
+
+		return $text;
+	}
+
+	/**
+	 * Configurable module
+	 *
+	 * @return $inputfields
+	 *
+	 */
+	public function getModuleConfigInputfields($inputfields) {
+		$modules = $this->wire('modules');
+		$fields = $this->wire('fields');
+
+		$wrapper = $modules->get("InputfieldFieldset");
+		$wrapper->set('label', $this->_("Destination"));
+
+		$name = 'destination';
+		$value = $this->get($name);
+		$f = $modules->get("InputfieldSelect");
+		$f->set('label', $this->_("Destination field"));
+		$f->set('description', $this->_("In which field should we store the concatenated text?"));
+		$f->set('name', $name);
+		$f->set('value', $value);
+
+		$f->addOption('', '');
+		foreach ($fields as $field) {
+			if (!$field->type instanceof FieldtypeText) continue;
+			$f->addOption($field->name, $field->name);
+		}
+		$wrapper->add($f);
+
+		$name = "quiet";
+		$value = $this->get($name);
+		$f = $modules->get("InputfieldCheckbox");
+		$f->set('label', $this->_("Save quiet?"));
+		$f->set('label2', $this->_("quiet"));
+		$f->set('columnWidth', 25);
+		$f->attr('checked', $value);
+		$f->attr('name', $name);
+		$f->attr('value', $value);
+		$wrapper->add($f);
+
+		$name = "noHooks";
+		$value = $this->get($name);
+		$f = $modules->get("InputfieldCheckbox");
+		$f->set('label', $this->_("Save noHooks?"));
+		$f->set('label2', $this->_("noHooks"));
+		$f->set('columnWidth', 25);
+		$f->attr('checked', $value);
+		$f->attr('name', $name);
+		$f->attr('value', $value);
+		$wrapper->add($f);
+
+		$name = "hide";
+		$value = $this->get($name);
+		$f = $modules->get("InputfieldCheckbox");
+		$f->set('label', $this->_("Hide destination inputfield"));
+		$f->set('label2', $this->_("Hide it!"));
+		$f->set('columnWidth', 50);
+		$f->set('description', $this->_("Hides destination inputfield for non-superusers."));
+		$f->attr('checked', $value);
+		$f->attr('name', $name);
+		$f->attr('value', $value);
+		$inputfields->add($wrapper->add($f));
+
+		$name = 'source';
+		$value = $this->get($name);
+		$f = $modules->get("InputfieldAsmSelect");
+		$f->set('label', $this->_("Source"));
+		$f->set('description', $this->_("Textfields/Pagefields for concatenation text."));
+		$f->set('notes', $this->_("Pagefields only store their title|name in the destination."));
+		$f->set('name', $name);
+		$f->set('value', $value);
+		$f->addOption('', '');
+		// $f->showIf = "destination!=''";
+		foreach ($fields as $field) {
+			$isTypeText = wireInstanceOf($field->type, 'FieldtypeText');
+			$isTypePage = wireInstanceOf($field->type, 'FieldtypePage');
+			if (!$isTypeText && !$isTypePage) continue;
+			if ($this->destination === $field->name) continue;
+			$f->addOption($field->name, $field->name);
+		}
+		$inputfields->add($f);
+	}
+}
