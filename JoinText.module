@@ -1,7 +1,7 @@
 <?php namespace ProcessWire;
 
 /**
- * Joins text from selected fields and saves it to destination field.
+ * Joins text from selected fields and saves it to assigigned field.
  *
  * @author Martijn Geerts (Agrio)
  *
@@ -24,7 +24,7 @@ class JoinText extends WireData implements Module, ConfigurableModule {
 	public static function getModuleInfo() {
 		return array(
 			'title' => 'Join Text',
-			'version' => '0.0.2',
+			'version' => '0.0.4',
 			'summary' => __("Joins text from selected fields and saves it to assigned field. "),
 			'author' => 'Martijn Geerts',
 			'autoload' => true,
@@ -32,6 +32,90 @@ class JoinText extends WireData implements Module, ConfigurableModule {
 			'icon' => "link",
 			'permission' => 'page-edit',
 			);
+	}
+
+	/**
+	 * Defaults
+	 *
+	 * @var array
+	 */
+	private $defaults = array(
+		"quiet" => true,
+		"noHooks" => true,
+		"hide" => true,
+		"minLength" => 3,
+	);
+
+	/**
+	 * Text sanitizer
+	 *
+	 * Text sanitizer for storing.
+	 *
+	 * @param string $text
+	 * @return void
+	 */
+	public static function sanitizeText($text, $minLength = 3) {
+		$text = ' ' . strip_tags($text);
+		// Drop non word chars
+		$text = preg_replace('/[^a-z\d]+/i', ' ', $text);
+		// Drop small words
+		if ($minLength !== false) $text = preg_replace("/\b\w{1," . $minLength ."}\b/", ' ', $text);
+		// Replace double+ whitespaces
+		$text = preg_replace('!\s+!', ' ', $text);
+		// Trim it
+		$text = trim($text);
+		// Trim it
+		$text = mb_strtolower($text);
+
+		return $text;
+	}
+
+	/**
+	 * Get value from Page
+	 *
+	 * @param Page $page
+	 * @param string $name Fieldname
+	 * @return string
+	 */
+	private function getValue(Page $page, $fieldname) {
+		if ($fieldname === $this->destination) return;
+		$value = $page->get($fieldname);
+		return is_string($value) ? $value . " " : '';
+	}
+
+	/**
+	 * Get search templates
+	 *
+	 * @return TemplatesArray
+	 */
+	public function getSearchTemplates() {
+		$cached = $this->get('templatesArray');
+		if ($cached instanceof TemplatesArray) return $cached;
+
+		/** @var FieldsArray */
+		$fieldsArray = $this->wire('fields')->getAll();
+		/** @var string $destination field name */
+		$destination = $this->destination;
+		if (!$destination) return new TemplatesArray();
+
+		/** @var Field */
+		$field = $fieldsArray->get($destination);
+		if (!$field) return new TemplatesArray();
+
+		$templatesArray = $field->getTemplates();
+		$this->set('templatesArray', $templatesArray);
+		return $templatesArray;
+	}
+
+	/**
+	 * Set defaults
+	 *
+	 * @return void
+	 */
+	public function __construct() {
+		foreach ($this->defaults as $key => $value) {
+			$this->set($key, $value);
+		}
 	}
 
 	/**
@@ -55,19 +139,6 @@ class JoinText extends WireData implements Module, ConfigurableModule {
 	}
 
 	/**
-	 * Get value from Page
-	 *
-	 * @param Page $page
-	 * @param string $name Fieldname
-	 * @return string
-	 */
-	private function getValue(Page $page, $fieldname) {
-		if ($fieldname === $this->destination) return;
-		$value = $page->get($fieldname);
-		return is_string($value) ? $value . " " : '';
-	}
-
-	/**
 	 * Save destination field
 	 *
 	 * @note The page from PageEdit::getPage will alway be the last page saved.
@@ -78,7 +149,7 @@ class JoinText extends WireData implements Module, ConfigurableModule {
 	public function afterPagesSaved(HookEvent $event) {
 		if (!$this->saveDestination) return;
 
-		/** @var Page $targetPage PageEditExecute edit page */
+		/** @var Page $page Page saved */
 		$targetPage = $this->get('targetPage');
 		/** @var Page $page Can be repeater like page */
 		$pageFromField = $event->arguments(0);
@@ -116,10 +187,24 @@ class JoinText extends WireData implements Module, ConfigurableModule {
 			}
 		}
 
-		$targetPage->setAndSave($this->destination, self::sanitizeText($text), array(
+		$sanitized = self::sanitizeText($text, $this->minLength);
+		$sanitized = $this->applyBlacklist($sanitized);
+
+		$targetPage->setAndSave($this->destination, $sanitized, array(
 			"quiet" => $this->quiet,
 			"noHooks" => $this->noHooks)
 		);
+	}
+
+	/**
+	 * Filter string by blacklist
+	 *
+	 * @return string
+	 */
+	private function applyBlacklist($text) {
+		$blacklist = explode(" ", strval($this->blacklist));
+		$out = str_replace($blacklist, "", $text);
+		return preg_replace('!\s+!', ' ', $out);
 	}
 
 	/**
@@ -128,7 +213,9 @@ class JoinText extends WireData implements Module, ConfigurableModule {
 	 * @param ProcessPageEdit $pageEdit
 	 * @return void
 	 */
-	private function hideDestination(ProcessPageEdit $pageEdit) {
+	public function hideDestination(HookEvent $event) {
+		/** @var ProcessPageEdit $pageEdit */
+		$pageEdit = $event->object;
 		$field = $pageEdit->fields->get($this->destination);
 
 		if ($this->wire('user')->isSuperuser()) {
@@ -145,72 +232,153 @@ class JoinText extends WireData implements Module, ConfigurableModule {
 	 * @param HookEvent $event
 	 * @return void
 	 */
-	public function beforeProcessPageEditExecute(HookEvent $event) {
-		/** @var ProcessPageEdit */
-		$pageEdit = $event->object;
+	public function beforeSaveReady(HookEvent $event) {
 		/** @var Page ProcessPageEdit page */
-		$page = $pageEdit->getPage();
+		$page = $event->arguments(0);
+
 		/** @var FieldGroup */
 		$fieldsFromTemplate = $page->template->fields;
 
 		if (!$this->destination) return;
 		if (!$fieldsFromTemplate->has($this->destination)) return;
-		if ($this->hide) $this->hideDestination($pageEdit);
 
 		$this->set('fieldsFromTemplate', $fieldsFromTemplate);
 		$this->set('targetPage', $page);
+
 		$this->addHookAfter("Fieldtype::savePageField", $this, "afterPagesSavedField");
 		$this->addHookAfter("pages::saved", $this, "afterPagesSaved");
 	}
 
 	public function init() {
-		$this->addHookBefore("ProcessPageEdit::execute", $this, "beforeProcessPageEditExecute");
+		if (!$this->get('blacklistPath')) {
+			/** @var Config */
+			$config = $this->wire('config');
+			$rootLength = strlen($config->paths->root) - 1;
+			$blacklistPath = $config->paths->get($this->className());
+			$this->set('blacklistPath', substr($blacklistPath, $rootLength) . "blacklist.txt");
+		}
+
+		foreach ($this->defaults as $key => $value) {
+			$_value = $this->get($key);
+			if ($key === "minLength" && $_value === "") {
+				$this->set($key, $value);
+			} else if ($_value === null) {
+				$this->set($key, $value);
+			}
+		}
+
+		$this->addHookBefore("Pages::saveReady", $this, "beforeSaveReady");
+		$this->addHookBefore("ProcessPageEdit::execute", $this, "hideDestination");
 	}
 
 	/**
-	 * Defaults
+	 * Backup Database
 	 *
-	 * @var array
 	 */
-	private $defaults = array(
-		"quiet" => true,
-		"noHooks" => true,
-		"hide" => true,
-	);
+	private function databaseBackup() {
+		/** @var WireDatabaseBackup */
+		$backup = $this->wire('database')->backups();
+		$file = $backup->backup();
 
-	/**
-	 * Set defaults
-	 *
-	 */
-	public function __construct() {
-		foreach ($this->defaults as $key => $value) $this->set($key, $value);
-	}
+		if ($file) {
+			$message = sprintf('%1$s module succesfuly created a backup on %2$s', $this->className(), date("Y.m.d H:i:s"));
+			$this->message($message, true);
+		}
 
-	public function set($key, $value) {
-		if (isset($this->defaults[$key])) $value = boolval($value);
-		parent::set($key, $value);
+		// Log errors
+		foreach ($backup->errors() as $error) $this->error($error, true);
+		return $file ? true : false;
 	}
 
 	/**
-	 * Text sanitizer
+	 * Re-save every destination field
 	 *
-	 * Text sanitizer for storing.
-	 *
-	 * @param string $text
 	 * @return void
 	 */
-	public static function sanitizeText($text) {
-		$text = ' ' . strip_tags($text);
-		// Drop non word chars
-		$text = preg_replace('/[^a-z\d]+/i', ' ', $text);
-		// Drop small words
-		$text = preg_replace("/\b\w{1,3}\b/", ' ', $text);
-		// Replace double+ whitespaces
-		$text = preg_replace('!\s+!', ' ', $text);
-		// Trim it
-		$text = trim($text);
+	private function forceSaveDestinationField() {
 
-		return $text;
+		$this->addHookAfter("Fieldtype::savePageField", $this, "afterPagesSavedField");
+		$this->addHookAfter("pages::saved", $this, "afterPagesSaved");
+
+		$templates = $this->getSearchTemplates();
+		if (!count($templates)) {
+			$this->warning("Destination field is not found or is not attached to any template.");
+			return;
+		}
+
+		$success = $this->databaseBackup();
+		if (!$success) return false;
+
+		$this->set('saveDestination', true);
+
+		$pages = $this->wire('pages');
+		$start = 0;
+		$limit = 20;
+		$templateIDS = $templates->implode("|", "id");
+		$total = $pages->count("template=" . $templateIDS . ", include=all");
+
+		$numSaved = 0;
+		$failed = array();
+
+		do {
+			$searchFieldPages = $pages->find("template=" . $templateIDS . ", include=all, limit=" . $limit . ", start=" . $start);
+
+			foreach ($searchFieldPages as $page) {
+				$fields = $page->template->fields;
+				$this->set('targetPage', $page);
+				$this->set('fieldsFromTemplate', $fields);
+
+				$skip = true;
+				foreach ($fields as $field) {
+					if (in_array($field->name, $this->source)) {
+						$skip = false;
+						$page->trackChange($field->name);
+						break;
+					}
+				}
+
+				// When fields has no source field.
+				if ($skip) continue;
+
+				$success = $pages->save($page);
+
+				if ($success) {
+					$numSaved++;
+				} else {
+					$failed[] = $page->id;
+				}
+			}
+
+			set_time_limit(30);
+			$start += $limit;
+		} while ($start <= $total);
+
+		$this->message(sprintf($this->_('%d page(s) modified.'), $numSaved));
+		if (count($failed)) {
+			$this->error(sprintf($this->_('Error saving pages: %s'), implode(", ", $failed)), true);
+		}
+	}
+
+	/**
+	 * Build blacklist
+	 *
+	 * @return void
+	 */
+	private function buildBlacklist() {
+		$config = $this->wire("config");
+		$part = trim($this->blacklistPath, "/");
+		$path = $config->paths->root . $part;
+
+		if (!is_file($path)) {
+			$this->error($this->_('Incorrect path to blacklist words file.'));
+			return;
+		}
+
+		$text = strval(file_get_contents($path));
+		$text = self::sanitizeText($text, $this->minLength);
+		$words = array_unique(explode(" ", $text));
+		sort($words);
+		$this->set("blacklist", implode(" ", $words));
 	}
 
 	/**
@@ -293,5 +461,66 @@ class JoinText extends WireData implements Module, ConfigurableModule {
 			$f->addOption($field->name, $field->name);
 		}
 		$inputfields->add($f);
+
+		$this->buildBlacklist();
+
+		$wrapper = $modules->get("InputfieldFieldset");
+		$wrapper->set('label', $this->_("Blacklist"));
+
+		if ($this->blacklist) {
+			$wrapper->set('description', "**Words in blacklist:**" . $this->blacklist . ".");
+		}
+
+		$name = 'blacklistPath';
+		$value = $this->get($name);
+		$f = $modules->get("InputfieldText");
+		$f->set('label', $this->_("Blacklist path"));
+		$f->set('description', $this->_('Path starts at `$config->urls->root`.'));
+		$f->set('columnWidth', 50);
+		$f->set('required', true);
+		$f->set('name', $name);
+		$f->set('value', $value);
+		$wrapper->add($f);
+
+		$name = 'minLength';
+		$value = $this->get($name);
+		$f = $modules->get("InputfieldInteger");
+		$f->set('label', $this->_("Minimum length for keywords"));
+		$f->set('description', $this->_('Words smaller then this are filtered from destination field.'));
+		$f->set('columnWidth', 50);
+		$f->set('required', true);
+		$f->set('name', $name);
+		$f->set('value', $value);
+		$wrapper->add($f);
+
+
+		$name = 'blacklist';
+		$value = $this->get($name);
+		$f = $modules->get("InputfieldHidden");
+		$f->set('name', $name);
+		$f->set('value', $value);
+
+		$wrapper->add($f);
+		$inputfields->add($wrapper);
+
+		$destination = $this->get('destination');
+
+		if ($destination) {
+			$name = "forceSave";
+			$value = $this->get($name);
+
+			$f = $modules->get("InputfieldCheckbox");
+			$f->set('label', $this->_("Re-save destination field values?"));
+			$f->set('label2', $this->_("Force save all destination fields"));
+			$f->set('description', sprintf($this->_('When checked and the module config is saved, we will update the text in all the pages where the desatination field “%s” exist.'), $destination));
+			$f->set('notes', $this->_("Depending on the amount of pages re-saving the field may take a while."));
+			// $f->attr('checked', $value);
+			$f->attr('name', $name);
+			$inputfields->add($f);
+
+			if (ctype_digit($this->input->post($name)) && $value)  {
+				$this->forceSaveDestinationField();
+			}
+		}
 	}
 }
